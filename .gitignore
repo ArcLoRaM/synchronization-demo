@@ -1,11 +1,22 @@
 # Prerequisites
 *.d
 
+# ds_Store
+.DS_Store
+
 # Object files
 *.o
 *.ko
 *.obj
 *.elf
+
+# sdkconfig.old
+/child/sdkconfig.old
+/master/sdkconfig.old
+
+# Build
+child/build/
+master/build/
 
 # Linker output
 *.ilk
