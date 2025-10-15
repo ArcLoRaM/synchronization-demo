@@ -1,15 +1,9 @@
-/*
- * SPDX-FileCopyrightText: 2010-2022 Espressif Systems (Shanghai) CO LTD
- *
- * SPDX-License-Identifier: CC0-1.0
- */
 #include <RadioLib.h>
+#include "freertos/projdefs.h"
 #include "hal/ESP32S3Hal/Esp32S3Hal.hpp"   // include your HAL implementation
 #include <oled_display.h>
 #include "driver/i2c_master.h"
 #include "esp_log.h"
-
-
 #include <stdio.h>
 #include <inttypes.h>
 #include "sdkconfig.h"
@@ -18,7 +12,12 @@
 #include "esp_chip_info.h"
 #include "esp_flash.h"
 #include "esp_system.h"
-
+#include "driver/gpio.h"
+#include <time.h>
+#include <stdlib.h>
+#include <ds3231.h>
+#include "sdcard.h"
+#include "driver/gpio.h"
 
 #define RADIO_NSS   (8)   // LoRa CS
 #define RADIO_IRQ   (14)  // DIO1
@@ -29,17 +28,29 @@
 #define RADIO_MISO  (11)
 #define RADIO_MOSI  (10)
 
+static const char *TAG = "CHILD";
 
-
-static const char *TAG = "LoRa+OLED";
-
-
-
-
+static DS3231_Info s_ds3231;
 
 extern "C" void app_main(void)
 {
-      // ==== OLED Initialization ====
+    ESP_LOGI(TAG, "Initializing SD card...");
+    sdcardinitialize();
+
+    ESP_LOGI(TAG, "Initializing DS3231...");
+    ds3231_init_info(&s_ds3231, I2C_NUM_0, GPIO_NUM_21, GPIO_NUM_22, 1000);
+
+    vTaskDelay(pdMS_TO_TICKS);
+
+    esp_err_t sqw = ds3231_enable_sqw_1hz(&s_ds3231, true);
+    if(sqw == ESP_OK) {
+        ESP_LOGI(TAG, "DS3231 SQW 1 Hz enabled");
+    } else {
+        ESP_LOGW(TAG, "Failed to enable SQW: %d", (int)sqw);
+    }
+
+
+    // ==== OLED Initialization ====
     ESP_ERROR_CHECK(oled_init());
     oled_clear();
     oled_draw_text(0, 0, "Heltec ESP32-S3");

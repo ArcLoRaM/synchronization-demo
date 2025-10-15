@@ -34,7 +34,7 @@
 
 #define PPS_GPIO_PIN  GPIO_NUM_4  // GPS PPS input
 
-static const char *TAG = "COMM";
+static const char *TAG = "MASTER";
 
 static DS3231_Info s_ds3231;
 
@@ -72,7 +72,7 @@ extern "C" void app_main(void)
     sdcardinitialize();
 
     ESP_LOGI(TAG, "Initializing DS3231...");
-    ds3231_init_info(&s_ds3231, I2C_NUM_0, GPIO_NUM_21, GPIO_NUM_22, 1000);
+    ds3231_init_info(&s_ds3231, I2C_NUM_0, GPIO_NUM_48, GPIO_NUM_47, 1000);
 
     vTaskDelay(pdMS_TO_TICKS(10));
 
@@ -151,4 +151,3 @@ extern "C" void app_main(void)
     oled_draw_text(0, 1, "----------------");
 
    }
-}

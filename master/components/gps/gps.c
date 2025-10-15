@@ -3,7 +3,6 @@
 #include "driver/uart.h"
 #include "freertos/projdefs.h"
 #include "esp_timer.h"
-#include "esp_sntp.h"
 #include "sys/time.h"
 #include <stdio.h>
 #include <string.h>

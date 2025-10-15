@@ -6,13 +6,12 @@
 #include "esp_log.h"
 #include "esp_vfs_fat.h"
 #include "sdmmc_cmd.h"
-#include "driver/spi_master.h"
 #include <driver/sdmmc_host.h>
 #include <driver/sdmmc_defs.h>
 #include "driver/gpio.h"
 
 #define PIN_NUM_MISO  GPIO_NUM_39
-#define PIN_NUM_MOSI  GPIO_NUM_40
+#define PIN_NUM_MOSI GPIO_NUM_40
 #define PIN_NUM_CLK   GPIO_NUM_41
 #define PIN_NUM_CS    GPIO_NUM_42
 
