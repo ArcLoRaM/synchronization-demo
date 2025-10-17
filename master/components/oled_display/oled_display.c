@@ -40,6 +40,7 @@ static inline esp_err_t oled_write_cmds(const uint8_t* cmds, size_t n) {
     }
 
     for (size_t i = 0; i < n; ++i) {
+        vTaskDelay(pdMS_TO_TICKS(10)); // small delay between commands
         uint8_t buf[2] = { 0x00, cmds[i] };  // control=0x00 (command), then command byte
         esp_err_t err = ESP_FAIL;
 
@@ -50,7 +51,7 @@ static inline esp_err_t oled_write_cmds(const uint8_t* cmds, size_t n) {
             err = i2c_master_transmit(s_dev, buf, sizeof(buf), pdMS_TO_TICKS(100));
 
             if (err == ESP_OK) break; // success
-            ESP_LOGW(TAG, "I2C cmd 0x%02X failed (try %d)", cmds[i], attempt + 1);
+           // ESP_LOGW(TAG, "I2C cmd 0x%02X failed (try %d)", cmds[i], attempt + 1);
             vTaskDelay(pdMS_TO_TICKS(10)); // short pause between retries
         }
 

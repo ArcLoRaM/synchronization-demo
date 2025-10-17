@@ -23,6 +23,10 @@ master/build/
 *.map
 *.exp
 
+# cache
+child/.cache
+master/.cache
+
 # Precompiled Headers
 *.gch
 *.pch

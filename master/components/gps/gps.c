@@ -1,6 +1,7 @@
 #include "gps.h"
 #include "esp_log.h"
 #include "driver/uart.h"
+#include "driver/mcpwm_prelude.h"
 #include "freertos/projdefs.h"
 #include "esp_timer.h"
 #include "sys/time.h"
@@ -8,9 +9,9 @@
 #include <string.h>
 #include <time.h>
 #include <math.h>
-#include <ds3231.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include "esp_attr.h"
 
 // access RTC slow clock time in microseconds
 extern uint64_t esp_rtc_get_time_us(void);
@@ -18,10 +19,10 @@ extern uint64_t esp_rtc_get_time_us(void);
 // ------------------ calibration configuration ------------------
 #define CALIBRATION_DURATION_PPS 600  // 10 minutes @ 1 PPS
 // ----------------------------------------------------------------
+#define CAPTURE_WINDOW_SIZE 50
 
 // ------------------ constants ------------------
-static DS3231_Info* s_rtc = NULL;  // external RTC handle
-void gps_register_ds3231(DS3231_Info* rtc) { s_rtc = rtc; }
+// No external RTC (DS3231) on master
 
 static volatile uint64_t rtc32k_sync_us = 0;   // esp_rtc_get_time_us() captured at sync PPS
 static volatile uint64_t epoch_sync_us  = 0;   // Epoch microseconds at sync
@@ -32,6 +33,7 @@ static const int GPS_UART_TIMEOUT_MS = 200;
 static const int GPS_LOG_EVERY_S = 60;  // periodic console GPS info
 // --------------------------------------------------------------------------
 
+static portMUX_TYPE cap_mux = portMUX_INITIALIZER_UNLOCKED;
 volatile uint64_t pps_count = 0;
 volatile bool time_synchronized = false;
 static struct tm synchronized_time;
@@ -39,6 +41,8 @@ static uint64_t sync_timestamp_us = 0;
 static volatile bool pending_sync = false;              // armed when we parsed a valid GPRMC, waiting for next PPS
 static volatile uint64_t pending_sync_target_sec = 0;   // time_t (seconds since epoch) to set at the PPS
 static volatile uint64_t pending_sync_armed_pps = 0;    // pps_count value when we armed the sync
+static volatile char s_last_gprmc_status = 'V';
+static volatile uint64_t s_last_gprmc_time_us = 0;
 
 // ------------------ Calibration state ------------------
 static bool     s_calibration_active = true;   // true until 10 minute window collected
@@ -50,8 +54,69 @@ static double   s_xtal_ppm_correction = 0.0;   // microseconds drift per second 
 static double   s_ds_ppm_correction   = 0.0;   // same for DS3231 (if SQW valid)
 // --------------------------------------------------------
 
+typedef struct {
+    uint32_t cap_value;
+    uint64_t sys_time_us;
+} pps_hw_capture;
+
+static volatile pps_hw_capture captures[CAPTURE_WINDOW_SIZE];
+static volatile int capture_index = 0;
+static volatile uint64_t total_captures = 0;
+static volatile uint64_t last_callback_time = 0;  // last ISR time (us)
+static volatile uint64_t last_pps_edge_time_us = 0; // esp_timer time at PPS edge
+static volatile uint64_t last_pps_epoch_sec = 0;    // epoch seconds at PPS edge (valid after sync)
+
+// Retained across deep sleep (RTC slow memory)
+typedef struct {
+    uint64_t epoch_sec_at_sync;   // epoch seconds at last sync PPS
+    uint64_t rtc32k_time_at_sync; // esp_rtc_get_time_us() at that PPS
+    uint32_t crc32;               // simple CRC to validate
+} time_anchor_t;
+static RTC_DATA_ATTR time_anchor_t s_time_anchor = {0,0,0};
+
+static uint32_t crc32_simple(const void* data, size_t len) {
+    const uint8_t* p = (const uint8_t*)data; uint32_t c = 0xFFFFFFFFu;
+    for (size_t i=0;i<len;i++) { c ^= p[i]; for (int b=0;b<8;b++) c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1); }
+    return c ^ 0xFFFFFFFFu;
+}
+
 
 static FILE* log_file = NULL;
+
+extern volatile uint64_t pps_count;
+
+// hardware capture handles
+static mcpwm_cap_timer_handle_t cap_timer = NULL;
+static mcpwm_cap_channel_handle_t cap_channel = NULL;
+static int s_pps_gpio = -1;  // PPS GPIO selected at runtime
+
+static bool IRAM_ATTR pps_hw_capture_callback(mcpwm_cap_channel_handle_t cap_chan, const mcpwm_capture_event_data_t *edata, void *user_data){
+    // hardware captured timestamp
+    uint32_t hw_timestamp = edata->cap_value;
+
+    // system timestamp for comparison
+    uint64_t sys_timestamp = esp_timer_get_time();
+
+    // store in circular buffer
+    portENTER_CRITICAL_ISR(&cap_mux);
+    int idx = capture_index % CAPTURE_WINDOW_SIZE;
+    captures[idx].cap_value = hw_timestamp;
+    captures[idx].sys_time_us = sys_timestamp;
+    capture_index++;
+    total_captures++;
+    last_callback_time = sys_timestamp;
+    last_pps_edge_time_us = sys_timestamp;
+    if (time_synchronized && last_pps_epoch_sec != 0) {
+        // advance epoch seconds on each PPS edge after initial sync
+        last_pps_epoch_sec++;
+    }
+    portEXIT_CRITICAL_ISR(&cap_mux);
+
+    // feed GPS jitter/PPS accounting with this hardware-captured pulse
+    gps_record_pps_pulse(sys_timestamp);
+
+    return false;
+}
 
 
 // common function to record a PPS pulse timestamp
@@ -59,6 +124,107 @@ void gps_record_pps_pulse(uint64_t ts_us) {
     (void)ts_us; 
     pps_count++;
 }
+
+// ------------------initialize MCPWM hardware capture ------------------------
+esp_err_t init_hardware_pps_capture(void) {
+    if (s_pps_gpio < 0) {
+        // default to header-defined PPS pin if not set
+        s_pps_gpio = PPS_GPIO_PIN;
+    }
+    ESP_LOGI(GPS_TAG, "Initializing MCPWM hardware capture on GPIO %d", s_pps_gpio);
+
+    // Configure PPS GPIO as floating input to avoid loading open-drain outputs
+    gpio_config_t io_conf = {
+        .pin_bit_mask = (1ULL << s_pps_gpio),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    ESP_ERROR_CHECK(gpio_config(&io_conf));
+
+    mcpwm_capture_timer_config_t cap_timer_config = {
+        .clk_src = MCPWM_CAPTURE_CLK_SRC_DEFAULT,
+        .group_id = 0,
+        .resolution_hz = 1000000, // 1 MHz capture resolution
+    };
+
+    esp_err_t ret = mcpwm_new_capture_timer(&cap_timer_config, &cap_timer);
+
+    if(ret != ESP_OK) {
+        ESP_LOGE(GPS_TAG, "Failed to create a capture timer: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    mcpwm_capture_channel_config_t cap_chan_config = {
+        .gpio_num= s_pps_gpio,
+        .prescale = 1,
+        .flags.neg_edge = false,
+        .flags.pos_edge = true,
+        .flags.pull_up = false,
+    };
+
+    ret = mcpwm_new_capture_channel(cap_timer, &cap_chan_config, &cap_channel);
+    if(ret != ESP_OK){
+        ESP_LOGE(GPS_TAG, "Failed to create a capture channel: %s", esp_err_to_name(ret));
+        mcpwm_del_capture_timer(cap_timer);
+        return ret;
+    }
+
+    mcpwm_capture_event_callbacks_t cbs = {
+        .on_cap = pps_hw_capture_callback,
+    };
+
+    ret = mcpwm_capture_channel_register_event_callbacks(cap_channel, &cbs, NULL);
+    if (ret != ESP_OK) {
+        ESP_LOGE(GPS_TAG, "Failed to register capture callbacks: %s", esp_err_to_name(ret));
+        mcpwm_del_capture_channel(cap_channel);
+        mcpwm_del_capture_timer(cap_timer);
+        return ret;
+    }
+
+    // enable capture channel
+    ret = mcpwm_capture_channel_enable(cap_channel);
+    if (ret != ESP_OK) {
+        ESP_LOGE(GPS_TAG, "Failed to enable capture channel: %s", esp_err_to_name(ret));
+        mcpwm_del_capture_channel(cap_channel);
+        mcpwm_del_capture_timer(cap_timer);
+        return ret;
+    }
+
+    // enable and start capture timer
+    ret = mcpwm_capture_timer_enable(cap_timer);
+    if (ret != ESP_OK) {
+        ESP_LOGE(GPS_TAG, "Failed to enable capture timer: %s", esp_err_to_name(ret));
+        mcpwm_capture_channel_disable(cap_channel);
+        mcpwm_del_capture_channel(cap_channel);
+        mcpwm_del_capture_timer(cap_timer);
+        return ret;
+    }
+
+    ret = mcpwm_capture_timer_start(cap_timer);
+    if (ret != ESP_OK) {
+        ESP_LOGE(GPS_TAG, "Failed to start capture timer: %s", esp_err_to_name(ret));
+        mcpwm_capture_timer_disable(cap_timer);
+        mcpwm_capture_channel_disable(cap_channel);
+        mcpwm_del_capture_channel(cap_channel);
+        mcpwm_del_capture_timer(cap_timer);
+        return ret;
+    }
+
+    ESP_LOGI(GPS_TAG, "MCPWM hardware capture initialized on GPIO %d", s_pps_gpio);
+    return ESP_OK;
+}
+
+void gps_init_pps_capture(int pps_gpio) {
+    s_pps_gpio = pps_gpio; // use runtime-selected PPS GPIO
+    esp_err_t r = init_hardware_pps_capture();
+    if (r != ESP_OK) {
+        ESP_LOGE(GPS_TAG, "gps_init_pps_capture failed: %s", esp_err_to_name(r));
+    }
+}
+
+
 
 // synchronize the time fetched through GPRMC data from NMEA of the GPS module
 void synchronize_time_from_gprmc(const char* time_str, const char* date_str) {
@@ -244,14 +410,8 @@ void log_time_comparison_at_pps(const char* filename) {
         }
     }
 
-    // Temperature (independent of ds_valid for SQW) if RTC present
+    // Temperature field omitted (no DS3231)
     char temp_field[16] = "";
-    if (s_rtc) {
-        float temp_c = 0.0f;
-        if (ds3231_get_temperature(s_rtc, &temp_c) == ESP_OK) {
-            snprintf(temp_field, sizeof(temp_field), "%.2f", temp_c);
-        }
-    }
 
     // Decide which values to print: pre-calibration (raw) or post-calibration (compensated)
     int64_t log_xtal_offset = s_calibration_done ? xtal_offset_comp : xtal_offset_us;
@@ -316,8 +476,11 @@ void gps_initialize(void){
     };
     ESP_ERROR_CHECK(uart_param_config(uart_num, &uart_config));
 
-    // set UART pins(TX: IO4, RX: IO5, RTS: IO18, CTS: IO19)
-    ESP_ERROR_CHECK(uart_set_pin(UART_NUM_2, 17, 16, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
+    // Set UART2 TX/RX pins from configuration macros in gps.h
+    ESP_ERROR_CHECK(uart_set_pin(UART_NUM_2, GPS_UART_TX_PIN, GPS_UART_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
+    uint32_t actual_baud = 0;
+    uart_get_baudrate(UART_NUM_2, &actual_baud);
+    ESP_LOGI(GPS_TAG, "UART2 configured: TX=%d RX=%d baud=%u", (int)GPS_UART_TX_PIN, (int)GPS_UART_RX_PIN, (unsigned)actual_baud);
     
     
     ESP_LOGI(GPS_TAG, "GPS and PPS initialization complete");
@@ -336,14 +499,19 @@ void gps_uart_task(void) {
     char nmea_sentence[256];
     int sentence_pos = 0;
     uint64_t last_gps_log_time = 0;
+    uint64_t last_stats_time = 0;
+    uint32_t stats_bytes = 0;
+    uint32_t stats_dollars = 0;
 
     while (1) {
     int len = uart_read_bytes(UART_NUM_2, uart_buffer, uart_buffer_size - 1, pdMS_TO_TICKS(GPS_UART_TIMEOUT_MS));
 
-        if (len > 0) {
+    if (len > 0) {
+        stats_bytes += (uint32_t)len;
             for (int i = 0; i < len; i++) {
                 char c = uart_buffer[i];
                 if (c == '$') {
+            stats_dollars++;
                     sentence_pos = 0;
                     nmea_sentence[sentence_pos++] = c;
                 } else if (sentence_pos > 0) {
@@ -363,6 +531,8 @@ void gps_uart_task(void) {
                                 char time_str[32] = "";
                                 char date_str[32] = "";
                                 if (parse_gprmc_sentence(nmea_sentence, raw_time, raw_date, &status, time_str, date_str)) {
+                                    s_last_gprmc_status = status;
+                                    s_last_gprmc_time_us = esp_timer_get_time();
                                     if (!time_synchronized && status == 'A' && raw_time[0] && raw_date[0]) {
                                         synchronize_time_from_gprmc(raw_time, raw_date);
                                     }
@@ -385,6 +555,7 @@ void gps_uart_task(void) {
                 }
             }
         }
+
     // If we armed a PPS-aligned sync, complete it right after the next PPS occurs (pps_count incremented)
     if (pending_sync && pps_count > pending_sync_armed_pps) {
             struct timeval tv;
@@ -399,32 +570,18 @@ void gps_uart_task(void) {
                 synchronized_time = *utc_tm;
             }
 
-            // If external RTC is registered, set it to the same UTC at this PPS edge
-            if (s_rtc) {
-                struct tm set_tm = synchronized_time; // UTC
-                esp_err_t sr = ds3231_set_time(s_rtc, &set_tm);
-                if (sr == ESP_OK) {
-                    // Clear OSF so future boots know time is valid
-                    esp_err_t cr = ds3231_clear_oscillator_stop_flag(s_rtc);
-                    bool osf_after = true;
-                    esp_err_t gr = ds3231_get_oscillator_stop_flag(s_rtc, &osf_after);
-                    if (cr == ESP_OK && gr == ESP_OK && !osf_after) {
-                        ESP_LOGI(GPS_TAG, "DS3231 set at PPS to %04d-%02d-%02d %02d:%02d:%02d UTC (OSF cleared)",
-                                 set_tm.tm_year + 1900, set_tm.tm_mon + 1, set_tm.tm_mday,
-                                 set_tm.tm_hour, set_tm.tm_min, set_tm.tm_sec);
-                    } else {
-                        ESP_LOGW(GPS_TAG, "DS3231 set at PPS ok, but OSF not confirmed clear (cr=%d, gr=%d, osf=%d)", (int)cr, (int)gr, (int)osf_after);
-                    }
-                } else {
-                    ESP_LOGW(GPS_TAG, "Failed to set DS3231 time at PPS sync (err=%d)", (int)sr);
-                }
-            }
-
             sync_timestamp_us = esp_timer_get_time();
             // Anchor XTAL 32 kHz slow-clock time to UTC at this PPS boundary
             epoch_sync_us = (uint64_t)pending_sync_target_sec * 1000000ULL;
             rtc32k_sync_us = esp_rtc_get_time_us();
             rtc32k_inited = true;
+            // latch epoch seconds at the PPS edge we just synced to
+            last_pps_epoch_sec = pending_sync_target_sec;
+            // Save anchor in RTC memory (for restore after deep sleep)
+            s_time_anchor.epoch_sec_at_sync = last_pps_epoch_sec;
+            s_time_anchor.rtc32k_time_at_sync = rtc32k_sync_us;
+            s_time_anchor.crc32 = 0;
+            s_time_anchor.crc32 = crc32_simple(&s_time_anchor, sizeof(s_time_anchor) - sizeof(uint32_t));
             pps_count = 0;  // reset after synchronization at PPS edge
             time_synchronized = true;
             pending_sync = false;
@@ -434,7 +591,7 @@ void gps_uart_task(void) {
                      synchronized_time.tm_hour, synchronized_time.tm_min, synchronized_time.tm_sec);
         }
 
-        vTaskDelay(pdMS_TO_TICKS(10));
+    vTaskDelay(pdMS_TO_TICKS(10));
     }
 
     free(uart_buffer);
@@ -447,4 +604,99 @@ void start_gps_benchmark_tasks(const char* filename) {
     xTaskCreate((TaskFunction_t)gps_uart_task, "gps_uart_task", 4096, NULL, 5, NULL);
     
     ESP_LOGI(GPS_TAG, "GPS benchmark tasks started");
+}
+
+// ---- Debug helpers implementation ----
+uint64_t gps_get_pps_count(void) { return pps_count; }
+uint64_t gps_get_total_captures(void) { return total_captures; }
+uint32_t gps_get_last_capture_age_ms(void) {
+    uint64_t now = esp_timer_get_time();
+    uint64_t age_us = (last_callback_time > 0) ? (now - last_callback_time) : UINT64_MAX;
+    return (age_us == UINT64_MAX) ? 0xFFFFFFFFu : (uint32_t)(age_us / 1000ULL);
+}
+bool gps_get_pending_sync(void) { return pending_sync; }
+bool gps_get_time_synchronized(void) { return time_synchronized; }
+char gps_get_last_gprmc_status(void) { return s_last_gprmc_status; }
+uint32_t gps_get_last_gprmc_age_ms(void) {
+    uint64_t now = esp_timer_get_time();
+    uint64_t age_us = (s_last_gprmc_time_us > 0) ? (now - s_last_gprmc_time_us) : UINT64_MAX;
+    return (age_us == UINT64_MAX) ? 0xFFFFFFFFu : (uint32_t)(age_us / 1000ULL);
+}
+void gps_debug_dump_status(void) {
+    ESP_LOGI(GPS_TAG, "DBG: PPS=%llu, cap_total=%llu, cap_age_ms=%u, pending_sync=%d, synced=%d, GPRMC_stat=%c, gprmc_age_ms=%u",
+        (unsigned long long)pps_count,
+        (unsigned long long)total_captures,
+        gps_get_last_capture_age_ms(),
+        (int)pending_sync,
+        (int)time_synchronized,
+        s_last_gprmc_status,
+        gps_get_last_gprmc_age_ms());
+}
+
+// ---- PPS timing helpers implementation ----
+uint64_t gps_get_last_pps_edge_time_us(void) { return last_pps_edge_time_us; }
+uint64_t gps_get_last_pps_epoch_sec(void) { return last_pps_epoch_sec; }
+
+bool gps_wait_for_next_pps(uint32_t timeout_ms, uint64_t* out_epoch_sec, uint64_t* out_edge_time_us) {
+    uint64_t start = esp_timer_get_time();
+    uint64_t start_pps = pps_count;
+    while ((esp_timer_get_time() - start) < ((uint64_t)timeout_ms * 1000ULL)) {
+        if (pps_count > start_pps) {
+            if (out_edge_time_us) *out_edge_time_us = last_pps_edge_time_us;
+            if (out_epoch_sec) *out_epoch_sec = last_pps_epoch_sec ? last_pps_epoch_sec : 0ULL;
+            return true;
+        }
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+    return false;
+}
+
+// ---- Retained time anchor helpers ----
+bool gps_has_saved_time_anchor(void) {
+    time_anchor_t tmp = s_time_anchor;
+    uint32_t c = crc32_simple(&tmp, sizeof(tmp) - sizeof(uint32_t));
+    if (tmp.crc32 == c && tmp.epoch_sec_at_sync != 0 && tmp.rtc32k_time_at_sync != 0) {
+        return true;
+    }
+    return false;
+}
+
+void gps_clear_saved_time_anchor(void) {
+    s_time_anchor.epoch_sec_at_sync = 0;
+    s_time_anchor.rtc32k_time_at_sync = 0;
+    s_time_anchor.crc32 = 0;
+}
+
+bool gps_restore_time_from_anchor_and_pps(uint32_t pps_timeout_ms) {
+    if (!gps_has_saved_time_anchor()) return false;
+    // Wait for a PPS, then reconstruct epoch seconds without NMEA
+    uint64_t edge_epoch = 0, edge_us = 0;
+    if (!gps_wait_for_next_pps(pps_timeout_ms, &edge_epoch, &edge_us)) return false;
+
+    // Compute how many seconds elapsed since the saved anchor, using RTC slow clock
+    uint64_t now_rtc_us = esp_rtc_get_time_us();
+    uint64_t delta_us = (now_rtc_us >= s_time_anchor.rtc32k_time_at_sync) ? (now_rtc_us - s_time_anchor.rtc32k_time_at_sync) : 0ULL;
+    uint64_t elapsed_sec = delta_us / 1000000ULL; // coarse: 1-second resolution using PPS for alignment
+    uint64_t new_epoch_sec = s_time_anchor.epoch_sec_at_sync + elapsed_sec;
+
+    // Align settimeofday to the observed PPS edge
+    struct timeval tv;
+    tv.tv_sec = (time_t)new_epoch_sec;
+    tv.tv_usec = 0;
+    settimeofday(&tv, NULL);
+
+    // Update local sync state like the normal path
+    synchronized_time = *gmtime((time_t*)&tv.tv_sec);
+    sync_timestamp_us = esp_timer_get_time();
+    epoch_sync_us = (uint64_t)new_epoch_sec * 1000000ULL;
+    rtc32k_sync_us = esp_rtc_get_time_us();
+    rtc32k_inited = true;
+    last_pps_epoch_sec = new_epoch_sec;
+    time_synchronized = true;
+    pending_sync = false;
+    pps_count = 0;
+    ESP_LOGI(GPS_TAG, "Time restored from anchor at PPS: %04d-%02d-%02d %02d:%02d:%02d UTC",
+             synchronized_time.tm_year + 1900, synchronized_time.tm_mon + 1, synchronized_time.tm_mday,
+             synchronized_time.tm_hour, synchronized_time.tm_min, synchronized_time.tm_sec);
+    return true;
 }
