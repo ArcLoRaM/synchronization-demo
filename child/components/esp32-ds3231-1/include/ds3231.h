@@ -45,16 +45,18 @@
 #define DS3231_H
 
 #include <esp_err.h>
-#include <driver/i2c.h>
+#include <driver/i2c_master.h>
 #include <time.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-#define I2C_FREQ_HZ               400000
+#define DS3231_I2C_FREQ_HZ               100000
 
 #define DS3231_STAT_OSCILLATOR    0x80
+// Status register bit to enable 32kHz output on 32kHz pin
+#define DS3231_STAT_EN32KHZ       0x08
 
 #define DS3231_ADDR_TIME          0x00
 #define DS3231_ADDR_CONTROL       0x0e
@@ -80,10 +82,15 @@ enum {
 };
 
 typedef struct {
+    // Target I2C port the bus is created on (0 or 1)
     i2c_port_t port;
-    i2c_config_t cfg;
+    // 7-bit I2C address (0x68)
     uint8_t addr;
+    // Timeout for operations in milliseconds
     uint32_t timeoutMs;
+    // NG I2C handles (ESP-IDF v5+)
+    i2c_master_bus_handle_t bus;
+    i2c_master_dev_handle_t dev;
 } DS3231_Info;
 
 /**
@@ -93,6 +100,13 @@ typedef struct {
  * @param sda_gpio SDA GPIO
  * @param scl_gpio SCL GPIO
  * @param timeoutMS timeout for message transmissions
+ */
+/**
+ * Initialize DS3231 descriptor and attach to an existing I2C NG bus on the given port.
+ * Note: This function expects the I2C master bus to have been created already using
+ * i2c_new_master_bus(). It will retrieve the bus handle with i2c_master_get_bus_handle
+ * and add a DS3231 device to it. sda_gpio/scl_gpio are ignored in NG mode and kept
+ * for API compatibility.
  */
 void ds3231_init_info(DS3231_Info *ds3231, i2c_port_t port, gpio_num_t sda_gpio, gpio_num_t scl_gpio, uint32_t timeoutMs);
 
@@ -152,6 +166,12 @@ esp_err_t ds3231_enable_sqw_1hz(DS3231_Info *ds3231, bool enable);
  * @return ESP_OK on success
  */
 esp_err_t ds3231_get_temperature(DS3231_Info *ds3231, float *temperature_c);
+
+/**
+ * @brief Enable or disable the 32 kHz output on the DS3231 32kHz pin.
+ * This sets/clears EN32kHz bit in the status register (0x0F).
+ */
+esp_err_t ds3231_enable_32khz(DS3231_Info *ds3231, bool enable);
 
 #ifdef __cplusplus
 }
