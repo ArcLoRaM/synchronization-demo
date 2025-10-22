@@ -11,8 +11,8 @@
 #define TAG "oled_display"
 
 // ---- Heltec WiFi LoRa V3 (ESP32-S3) pins ----
-#define I2C_SDA_IO        33
-#define I2C_SCL_IO        18
+#define I2C_SDA_IO        18
+#define I2C_SCL_IO        17
 #define I2C_FREQ_HZ       400000
 #define I2C_PORT_NUM      0
 #define OLED_I2C_ADDR     0x3C
@@ -50,7 +50,7 @@ static inline esp_err_t oled_write_cmds(const uint8_t* cmds, size_t n) {
             err = i2c_master_transmit(s_dev, buf, sizeof(buf), pdMS_TO_TICKS(100));
 
             if (err == ESP_OK) break; // success
-            //ESP_LOGW(TAG, "I2C cmd 0x%02X failed (try %d)", cmds[i], attempt + 1);
+            ESP_LOGW(TAG, "I2C cmd 0x%02X failed (try %d)", cmds[i], attempt + 1);
             vTaskDelay(pdMS_TO_TICKS(10)); // short pause between retries
         }
 
@@ -106,13 +106,12 @@ static void oled_reset(void) {
 }
 
 void oled_vext_on(void) {
-    gpio_set_direction(VEXT_PIN, GPIO_MODE_OUTPUT);
-    gpio_set_level(VEXT_PIN, 0);   // LOW = ON
+
+
 }
 
 void oled_vext_off(void) {
-    gpio_set_direction(VEXT_PIN, GPIO_MODE_OUTPUT);
-    gpio_set_level(VEXT_PIN, 1);   // HIGH = OFF
+
 }
 
 // ------------------ public API ------------------
@@ -164,6 +163,7 @@ esp_err_t oled_init(void) {
         0x8D, 0x14,    // charge pump on
         0xAF           // display on
     };
+    vTaskDelay(pdMS_TO_TICKS(100));  // give OLED time after reset
     ESP_ERROR_CHECK(oled_write_cmds(init_seq, sizeof(init_seq)));
 
     // Clear once after init to get rid of random garbage
